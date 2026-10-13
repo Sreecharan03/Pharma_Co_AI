@@ -1,456 +1,112 @@
-# AI-Driven Pharmacovigilance System: Adverse Drug Reaction Severity Prediction
+# AI-Driven Pharmacovigilance: ADR Severity Prediction with Retrieval-Augmented Explanation
 
-**An MTech-level AI system for predicting Adverse Drug Reaction (ADR) severity and providing clinical decision support through machine learning and retrieval-augmented generation.**
+M.Tech project, Department of Computer Science and Engineering, Vishnu Women's University (2026-27).
 
----
+The system predicts the severity of adverse drug reactions (ADRs) as **Mild**, **Moderate** or **Critical** from drug metadata. It then retrieves similar historical cases and asks a large language model to write a clinical explanation grounded in those cases.
 
-## 📋 Executive Summary
+> This is a research prototype. It is not a medical device and must not replace clinical judgement.
 
-This project implements a **production-ready pharmacovigilance platform** that leverages machine learning and large language models to:
+## 1. Motivation and base paper
 
-- **Predict ADR Severity** (MILD, MODERATE, CRITICAL) from drug metadata using a trained XGBoost classifier
-- **Retrieve Similar Clinical Cases** via semantic search (ChromaDB + sentence embeddings)  
-- **Generate AI-Powered Clinical Explanations** using Groq's LLaMA 3 foundation model
-- **Support Clinical Decision-Making** with explainable predictions and evidence-based recommendations
+Most ADR models estimate whether an event is serious, or how often a reaction occurs, and give the clinician no graded severity and no explanation.
 
-The system processes **248,218+ medicines** from a comprehensive pharmacological dataset and serves as a real-time decision support tool for healthcare professionals.
+The base paper for this work is:
 
----
+> A. M. Mostafa et al., "Innovative Tailored Semantic Embedding and Machine Learning for Precise Prediction of Drug-Drug Interaction Seriousness," *IEEE Access*, vol. 13, pp. 49249-49270, 2025. DOI: 10.1109/ACCESS.2025.3552239
 
-## 🏗️ System Architecture
+That paper classifies drug-drug interactions from FAERS reports as serious or non-serious (binary) with BioWordVec embeddings and CatBoost (F1 73.32%, ROC-AUC 0.84). The authors name binary-only classification, a single dataset and limited interpretability as limitations. This project addresses them with three severity levels, a different dataset, and a retrieval-based explanation layer.
 
-### High-Level Pipeline
+Secondary reference: J. Wan et al., "DeepADR: multimodal prediction of adverse drug reaction frequency by integrating early-stage drug discovery information via Kolmogorov-Arnold networks," *Briefings in Bioinformatics* 26(6), bbaf695, 2025.
+
+## 2. System overview
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                  Input: Drug Details                    │
-│      (Name, Uses, Side Effects, Therapeutic Class)      │
-└─────────────────────┬───────────────────────────────────┘
-                      │
-        ┌─────────────┴─────────────┐
-        │                           │
-    ┌───▼──────────┐        ┌──────▼──────┐
-    │ ML Pipeline  │        │ RAG Pipeline │
-    └───┬──────────┘        └──────┬──────┘
-        │                         │
-    ┌───▼────────────────┐ ┌──────▼──────────┐
-    │ XGBoost Classifier │ │ ChromaDB Lookup │
-    │ • TF-IDF Features  │ │ Similar Cases   │
-    │ • Categorical Enc. │ │                 │
-    └───┬────────────────┘ └──────┬──────────┘
-        │                         │
-        └────────────┬────────────┘
-                     │
-            ┌────────▼─────────┐
-            │  Groq LLM Engine │
-            │  (Llama 3.1-8B)  │
-            │  • Generate Text │
-            │  • Clinical Info │
-            └────────┬─────────┘
-                     │
-        ┌────────────▼─────────────┐
-        │    Output Dashboard      │
-        │ • Severity Badge         │
-        │ • Confidence Score       │
-        │ • Similar Cases          │
-        │ • AI Explanation         │
-        └──────────────────────────┘
+Drug details (name, uses, class, habit-forming, side-effect count)
+        |
+        +--> TF-IDF + structured features (505) --> XGBoost --> severity + confidence
+        |
+        +--> sentence embedding --> ChromaDB (cosine) --> top-3 similar cases
+                                                              |
+        severity + confidence + similar cases ---------> LLM --> clinical explanation
 ```
 
-### Core Components
+| File | Role |
+|---|---|
+| `pipeline.py` | Loads the saved model, TF-IDF vectorizers and encoders; builds the feature vector; returns severity, confidence and class probabilities. Unseen class values fall back to code 0. |
+| `rag_llm.py` | Builds and queries the ChromaDB vector store (`all-MiniLM-L6-v2`, cosine) and calls the Groq API (`llama-3.1-8b-instant`, temperature 0.3, 500 tokens). |
+| `app.py` | Streamlit interface: input form, severity badge, probability chart, similar cases, explanation, vector-store rebuild button. |
 
-1. **ML Prediction Engine** (`pipeline.py`)
-   - XGBoost gradient boosting classifier trained on 248K+ medicine records
-   - Feature engineering: TF-IDF vectorization + categorical label encoding
-   - Real-time inference with confidence scoring
+## 3. Dataset
 
-2. **RAG & LLM Integration** (`rag_llm.py`)
-   - ChromaDB vector store with 248K+ indexed records
-   - Sentence embeddings (all-MiniLM-L6-v2) for semantic search
-   - Groq API for fast LLM inference (Llama 3.1-8B)
+[250K Medicines Usage, Side Effects and Substitutes](https://www.kaggle.com/datasets/shudhanshusingh/250k-medicines-usage-side-effects-and-substitutes) (Kaggle): **248,218** medicine records, 58 columns. Side-effect columns 35-41 are empty and were dropped.
 
-3. **Interactive Web Interface** (`app.py`)
-   - Streamlit-based UI for clinician interaction
-   - Real-time predictions and visual analytics
-   - API key management and vector store control
+The 42 side-effect columns and 5 use columns were merged into two text fields. Missing chemical and action classes (about 44%) were filled with "Unknown", and the 0.03% missing therapeutic classes with the mode.
 
----
+### Severity labels
 
-## 📊 Dataset & Exploratory Data Analysis
+The dataset has no severity field, so labels are **derived by rules** (`01_eda.ipynb`):
 
-### Dataset Source
-- **Name**: 250K Medicines Usage, Side Effects & Substitutes
-- **Source**: Kaggle (shudhanshusingh/250k-medicines-usage-side-effects-and-substitutes)
-- **Records**: 248,218 medicines
-- **Features**: 58 attributes (drug names, side effects, therapeutic classes, etc.)
+1. **Critical** if the side-effect text contains any life-threatening keyword (for example cardiac, liver, seizure, stroke, anaphylaxis, bleeding).
+2. Otherwise **Moderate** if the drug is habit-forming, has 10 or more side effects, or the text contains a moderate keyword (for example allergic reaction, depression, tremor).
+3. Otherwise **Mild**.
 
-### Data Characteristics
+| Class | Records | Share |
+|---|---|---|
+| Mild | 126,918 | 51.1% |
+| Moderate | 54,887 | 22.1% |
+| Critical | 66,413 | 26.8% |
 
-| Aspect | Details |
-|--------|---------|
-| **Total Records** | 248,218 |
-| **Side Effect Features** | 42 columns (aggregated into single field) |
-| **Drug Uses** | 5 columns per drug (consolidated) |
-| **Therapeutic Classes** | 15 major categories (ANTI INFECTIVES, CARDIAC, RESPIRATORY, etc.) |
-| **Chemical Classes** | Automated labeling (Macrolides, Penicillins, Beta-blockers, etc.) |
-| **Habit Forming Drugs** | ~35% classified as habit-forming |
+These are heuristic labels, not clinician annotations. Reported accuracy therefore measures agreement with the rules. See the limitations below.
 
-### Key EDA Findings (01_eda.ipynb)
+## 4. Method
 
-**Side Effect Patterns**:
-- Drugs average **3.2 reported side effects**
-- Most common: Nausea, Vomiting, Diarrhea, Headache, Dizziness
-- High variability: Range from 0 to 42 side effects per drug
+**Split.** Stratified 80/20, `random_state=42`: 198,574 training and 49,644 test records.
 
-**Severity Distribution** (engineered labels):
-- **MILD**: 158,402 (63.8%) — Non-critical, common side effects
-- **MODERATE**: 75,936 (30.6%) — Significant adverse reactions or habit-forming  
-- **CRITICAL**: 13,880 (5.6%) — Life-threatening reactions (cardiac, hepatic, seizures, etc.)
+**Features (505).** TF-IDF of drug name (300 features, 1-2 grams) and drug uses (200 features, 1-2 grams), plus five structured fields: side-effect count, habit-forming flag, and label-encoded therapeutic, chemical and action class. TF-IDF on the side-effect text was removed to avoid leaking the label source.
 
-**Missing Data Handling**:
-- Dropped 35+ side effect columns (>99% missing)
-- Consolidated remaining features via concatenation
-- Categorical features back-filled with "Unknown" class
+**Models.** All three use balanced class weights.
 
----
+| Model | Accuracy | Weighted F1 |
+|---|---|---|
+| Logistic Regression | 78.85% | 0.7916 |
+| Random Forest (200 trees, depth 20) | 92.25% | 0.9229 |
+| **XGBoost** (300 rounds, depth 6, lr 0.1) | **96.48%** | **0.9648** |
 
-## 🔬 Methodology
+XGBoost per-class F1 on the test set: Mild 0.98, Moderate 0.94, Critical 0.96.
 
-### Phase 1: Data Preprocessing (02_preprocessing.ipynb)
+**Retrieval.** Each medicine becomes one document (name, uses, side effects) embedded with `all-MiniLM-L6-v2` and stored in ChromaDB. The top three neighbours are shown to the user and given to the LLM together with the prediction and its confidence.
 
-**Data Cleaning Pipeline**:
-- Removed 100% missing columns (sideEffect35-41)
-- Standardized text: lowercasing, whitespace trimming, NaN handling
-- Consolidated 42 side effect columns → single text field
-- Consolidated 5 use columns → single text field
-
-**Class Imbalance Handling**:
-- Applied SMOTE (Synthetic Minority Oversampling Technique) 
-- Rebalanced minority CRITICAL class (5.6% → 33%)
-- Improved model sensitivity to rare but critical reactions
-
-**Train-Test Split**:
-- 80% training, 20% validation (stratified by severity)
-- Ensures class distribution preservation
-
-### Phase 2: Feature Engineering (03_feature_engineering.ipynb)
-
-**Text Feature Engineering**:
-
-1. **TF-IDF Vectorization**
-   - Drug Name TF-IDF: 300-dimensional vector (captures brand name patterns)
-   - Drug Uses TF-IDF: 200-dimensional vector (captures therapeutic keywords)
-   - Min document frequency: 1, Max DF: 90%
-
-2. **Categorical Encoding**
-   - **Therapeutic Class**: Label encoding (15 classes)
-   - **Chemical Class**: Label encoding with OOV fallback
-   - **Action Class**: Label encoding with fallback to 0
-
-3. **Numerical Features**
-   - **Side Effect Count** (se_count): Raw count of reported side effects
-   - **Habit Forming**: Binary encoding (0=No, 1=Yes)
-
-**Feature Space Dimensionality**: 300 (TF-IDF name) + 200 (TF-IDF use) + 5 (structured) = **505 dimensions**
-
-### Phase 3: Model Training (04_model_training.ipynb)
-
-**Algorithm: XGBoost Classifier**
-
-Why XGBoost for this task?
-- **Interpretability**: Feature importance scores for clinical validation
-- **Robustness**: Handles categorical features and class imbalance well
-- **Speed**: Fast inference (<50ms per prediction)
-- **Proven Track Record**: State-of-the-art for tabular data in healthcare
-
-**Hyperparameters**:
-```
-n_estimators=200, max_depth=8, learning_rate=0.1,
-subsample=0.8, colsample_bytree=0.8, gamma=0.5,
-objective='multi:softprob', eval_metric='mlogloss'
-```
-
-**Training Results**:
-- Cross-validation F1-score: ~0.74 (weighted)
-- Precision (CRITICAL): ~0.68 (critical for safety)
-- Recall (CRITICAL): ~0.56 (catch most serious cases)
-- ROC-AUC (macro): ~0.82
-- Inference Speed: 45ms/prediction
-
-**Model Artifacts**:
-- `best_model.pkl` (1.8 MB): Trained XGBoost classifier
-- `label_encoders.pkl` (40 KB): Encoders for categorical variables
-- `tfidf_name.pkl` (12 KB): TF-IDF vectorizer for drug names
-- `tfidf_use.pkl` (9 KB): TF-IDF vectorizer for drug uses
-
----
-
-## 🧠 ML Prediction Engine (pipeline.py)
-
-```python
-def predict_severity(drug_name, drug_uses, se_count, 
-                     therapeutic_class, chemical_class, action_class,
-                     habit_forming, model, tfidf_name, tfidf_use, label_encoders):
-    
-    # 1. Text Features
-    name_features = tfidf_name.transform([drug_name])      # (1, 300)
-    use_features = tfidf_use.transform([drug_uses])        # (1, 200)
-    
-    # 2. Categorical Encoding (with OOV safety)
-    tc_enc = safe_encode(label_encoders["Therapeutic Class"], therapeutic_class)
-    cc_enc = safe_encode(label_encoders["Chemical Class"], chemical_class)
-    ac_enc = safe_encode(label_encoders["Action Class"], action_class)
-    
-    # 3. Structured Features
-    struct = np.array([[se_count, habit_forming, tc_enc, cc_enc, ac_enc]])
-    
-    # 4. Concatenate All Features
-    X = sp.hstack([name_features, use_features, struct_sparse])  # (1, 505)
-    
-    # 5. Inference & Probability
-    proba = model.predict_proba(X)[0]
-    severity = LABEL_MAP[np.argmax(proba)]
-    confidence = float(proba[np.argmax(proba)])
-    
-    return {"severity": severity, "confidence": confidence, "probabilities": {...}}
-```
-
----
-
-## 🔍 RAG & LLM Integration (rag_llm.py)
-
-### ChromaDB Vector Store
-- **Embedding Model**: all-MiniLM-L6-v2 (384D, ~10KB per vector)
-- **Records Indexed**: 248,218 medicines
-- **Similarity Metric**: Cosine distance
-- **Query Speed**: ~200ms for top-3 retrieval
-- **Storage**: SQLite backend (`data/chroma_db/chroma.sqlite3`)
-
-### Groq LLaMA 3.1-8B Integration
-- **Model**: llama-3.1-8b-instant (optimized for speed)
-- **Context Window**: 8K tokens
-- **Temperature**: 0.3 (low for consistency)
-- **Max Output**: 500 tokens
-- **Response Time**: <1 second
-
-**Clinical Prompt Engineering**:
-```
-System: "You are a clinical pharmacovigilance assistant..."
-User: "Drug: [name], Symptoms: [description], Severity: [prediction]"
-Output: Structured clinical explanation with recommendations
-```
-
----
-
-## 🚀 Quick Start
-
-### Installation
+## 5. Run it
 
 ```bash
-# Clone repository
-git clone https://github.com/Sreecharan03/Pharma_Co_AI.git
-cd Pharma_Co_AI
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Set Groq API key
-export GROQ_API=gsk_<your_key>
-# OR update .env file: GROQ_API=gsk_<your_key>
-
-# Launch application
-streamlit run app.py
+cp .env.example .env        # add your Groq key
+streamlit run app.py        # http://localhost:8501
 ```
 
-Application opens at **http://localhost:8501**
+The Groq key is read from `GROQ_API`, or can be pasted into the app sidebar. A free key is available at https://console.groq.com. The sentence-embedding model downloads from Hugging Face on first run.
 
-### API Key Setup
+The repository includes the trained model, vectorizers, encoders, the cleaned CSV and a prebuilt vector store (`data/`), so the app works immediately. The notebooks (`01_eda` to `04_model_training`) reproduce the pipeline but use absolute paths from the original environment and need path edits.
 
-**Groq API**:
-- Get free key at https://console.groq.com
-- Free quota: ~500 requests/day
-- Required for LLM clinical explanations
+## 6. Known limitations
 
-### Configuration
+- **Heuristic labels.** The rules use side-effect count and habit-forming status, which are also model inputs. Part of the accuracy is the model recovering those rules. An ablation without these two features is planned.
+- **Single split.** One stratified split, no cross-validation, no hyperparameter search. The test set is also passed as `eval_set` to XGBoost for logging (no early stopping is used).
+- **Retrieval query.** The app builds the query from the drug name, uses and the predicted severity, which biases results toward matching labels. The indexed text also contains the severity label.
+- **Field naming.** "Drug Uses" is passed to the LLM as the reported symptoms.
+- **No evaluation of explanations.** Retrieval precision and explanation faithfulness are not yet measured.
+- **Input coverage.** The app dropdown offers 15 therapeutic classes, while the data has 22.
 
-**`.env` file required**:
-```bash
-GROQ_API=gsk_<your_groq_api_key>
-git-pat=ghp_<your_github_pat>  # for repo access
-```
+## 7. Planned work
 
----
+1. Ablation without side-effect count and habit-forming status.
+2. Benchmark the base paper's classifier family (CatBoost, LightGBM, XGBoost, Extra Trees, KNN, Naive Bayes) and a stacking ensemble, with Bayesian tuning and repeated cross-validation (mean and standard deviation).
+3. Embedding experiment: BioWordVec or BioBERT against TF-IDF.
+4. Compare imbalance strategies (downsampling, SMOTE, class weights) and report Critical-class recall.
+5. Fix retrieval leakage and add a separate symptoms input.
+6. Evaluate retrieval and explanations: precision@k, faithfulness (LLM-as-judge with manual review), with and without retrieval.
+7. SHAP explanations for individual predictions.
 
-## 📁 Project Structure
+## 8. Disclaimer
 
-```
-ADRSeverityPharmacoAI/
-├── README.md                          # Documentation (this file)
-├── requirements.txt                   # Python dependencies
-├── .env                               # API keys (DO NOT commit)
-│
-├── app.py                             # Streamlit web UI
-├── pipeline.py                        # ML prediction engine
-├── rag_llm.py                         # RAG & LLM integration
-│
-├── 01_eda.ipynb                       # Exploratory data analysis
-├── 02_preprocessing.ipynb             # Data cleaning & SMOTE
-├── 03_feature_engineering.ipynb       # TF-IDF & categorical encoding
-├── 04_model_training.ipynb            # XGBoost training & evaluation
-│
-└── data/
-    ├── drug_reviews/
-    │   ├── best_model.pkl             # Trained XGBoost classifier
-    │   ├── label_encoders.pkl         # Categorical encoders
-    │   ├── medicine_clean.csv          # Processed dataset (248K records)
-    │   └── features/
-    │       ├── tfidf_name.pkl         # Drug name vectorizer
-    │       └── tfidf_use.pkl          # Drug uses vectorizer
-    │
-    └── chroma_db/                      # Vector store (prebuilt, indexed)
-        ├── chroma.sqlite3             # Index metadata
-        └── <collection_id>/           # HNSW embedding files
-```
-
-### What's Included
-
-- ✅ `app.py`, `pipeline.py`, `rag_llm.py` — Full production app
-- ✅ `best_model.pkl` — Pre-trained XGBoost severity classifier (1.8 MB)
-- ✅ `label_encoders.pkl`, `tfidf_*.pkl` — Vectorizers & encoders
-- ✅ `medicine_clean.csv` — Source dataset (248K records)
-- ✅ `chroma_db/` — Prebuilt vector store (no rebuild needed)
-- ⚠️ `all-MiniLM-L6-v2` — Downloads automatically from Hugging Face on first run
-
----
-
-## 🎯 Key Features
-
-### 1. Real-Time ADR Prediction
-- Input drug details → get severity in <50ms
-- Confidence scores for clinical trust
-- Probability distribution across all classes
-
-### 2. Similar Case Retrieval
-- Semantic search across 248K historical cases
-- Top-3 similar drugs with comparative severity
-- Evidence-based precedent for decision support
-
-### 3. AI Clinical Explanations
-- LLaMA 3 generated clinical reasoning
-- Structured output: What, Why, Recommendations
-- Reference to similar case management
-
-### 4. Interactive Dashboard
-- Color-coded severity badges (🟢 MILD, 🟠 MODERATE, 🔴 CRITICAL)
-- Visual probability charts (Plotly)
-- Vector store management (rebuild option)
-
----
-
-## 📊 Model Performance
-
-| Metric | Value |
-|--------|-------|
-| **Overall Accuracy** | 81.2% |
-| **Weighted F1-Score** | 0.742 |
-| **MILD F1** | 0.88 |
-| **MODERATE F1** | 0.71 |
-| **CRITICAL F1** | 0.58 |
-| **ROC-AUC (macro)** | 0.82 |
-| **Inference Speed** | 45 ms |
-| **Sensitivity (CRITICAL)** | 56% |
-| **Specificity (CRITICAL)** | 95% |
-
----
-
-## 🔐 Security & Compliance
-
-⚠️ **Disclaimer**: System is for **decision support only**, not autonomous decision-making.
-
-**Data Handling**:
-- All predictions processed locally
-- Only API key stored in environment
-- Groq API uses TLS 1.3 encryption
-- No patient data retention
-
-**Production Recommendations**:
-- Implement user authentication
-- Log all predictions for audit trails
-- Use HIPAA-compliant infrastructure
-- Obtain IRB approval before clinical use
-- Regular model retraining with new ADR data
-
----
-
-## 💻 Requirements
-
-**System**:
-- Python 3.9+
-- RAM: 8GB minimum
-- Disk: 500MB (with prebuilt artifacts)
-
-**Dependencies** (see `requirements.txt`):
-- streamlit, plotly, pandas, numpy, scipy
-- scikit-learn, xgboost, imbalanced-learn
-- chromadb, sentence-transformers, groq
-
----
-
-## 📚 Research Methodology
-
-### Data Pipeline
-
-1. **EDA** (01_eda.ipynb): 248K medicine dataset profiling
-2. **Preprocessing** (02_preprocessing.ipynb): Cleaning, SMOTE, train-test split
-3. **Feature Engineering** (03_feature_engineering.ipynb): TF-IDF, encoding, concatenation
-4. **Model Training** (04_model_training.ipynb): XGBoost tuning, cross-validation, evaluation
-5. **Production** (app.py): Real-time predictions with RAG & LLM
-
-### Key Research Contributions
-
-- **Severity Label Engineering**: Keyword-based heuristics for automatic labeling
-- **Sparse Feature Concatenation**: Efficient 505D feature space
-- **SMOTE-Balanced XGBoost**: Improved CRITICAL class detection
-- **RAG Integration**: Evidence-based case retrieval for explanations
-- **LLM-Powered Explanations**: Structured clinical reasoning
-
----
-
-## 📖 Jupyter Notebooks
-
-| Notebook | Purpose |
-|----------|---------|
-| **01_eda.ipynb** | Dataset exploration, severity engineering, visualizations |
-| **02_preprocessing.ipynb** | Text consolidation, SMOTE balancing, train-test split |
-| **03_feature_engineering.ipynb** | TF-IDF vectorization, categorical encoding, feature creation |
-| **04_model_training.ipynb** | XGBoost training, cross-validation, model evaluation |
-
----
-
-## 🔄 Workflow
-
-```
-Data (248K) → EDA → Preprocessing → Feature Engineering → 
-XGBoost Training → Evaluation → Artifacts → Production App
-                                              (+ ChromaDB + Groq)
-```
-
----
-
-## 📞 Support
-
-**GitHub**: https://github.com/Sreecharan03/Pharma_Co_AI
-**Email**: charanch53030@gmail.com
-
----
-
-## ⚖️ License & Citation
-
-**Disclaimer**: For research and educational purposes. Always consult qualified healthcare providers.
-
-**Dataset**: Kaggle 250K Medicines (check original source for license)
-**Code**: MIT License
-
----
-
-**Status**: ✅ Production Ready | **Last Updated**: October 4, 2024
+For research and education only. Always consult a qualified healthcare professional about drug safety.

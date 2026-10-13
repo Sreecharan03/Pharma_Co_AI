@@ -24,3 +24,6 @@ Thumbs.db
 # Data (optional - large files)
 *.pkl.bak
 *.csv.bak
+
+# Third-party papers
+*.pdf
